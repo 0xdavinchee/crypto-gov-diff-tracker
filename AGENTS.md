@@ -53,4 +53,12 @@ Project note: `~/Documents/vault/pipeline/projects/<repo-name>.md`. Read it at s
 
 ## Project specifics
 
-<!-- Stack, commands, and conventions for this repo. Filled in by the spec stage. -->
+The v0 contract is in `docs/SPEC.md`. These commands and conventions are requirements for the implementation stages; this spec PR does not add the scaffold.
+
+- **Stack:** Node.js 24.x LTS, npm 11.x, strict TypeScript with ESM/NodeNext, Vitest, and GitHub Actions. Initial verified development versions: TypeScript 7.0.2, Vitest 5.0.5, and `@types/node` 24.19.2. Commit the npm lockfile. Use Node built-ins and no runtime dependencies.
+- **Setup:** `npm ci` after the scaffold exists. `npm run build` typechecks source and tests and emits runtime JavaScript into `dist/`.
+- **Tests:** `npm test` runs `vitest run`. The `ci` job runs `npm ci`, `npm run build`, and `npm test` on pull requests and pushes to `main`. No forum requests or other network calls in tests, including localhost; inject fixture-backed fetch responses and use temporary directories for state.
+- **Run:** `node dist/cli.js` or `npx --offline --package . crypto-gov-diff-tracker` from the built checkout. Defaults: `./forums.json` and `./.gov-diff/`, relative to the invocation directory; override with `--config` and `--state-dir`. No registry publication in v0.
+- **Conventions:** Small functions with separate config, Discourse, diff, snapshot, digest, and CLI units. Shared `Topic`, `Snapshot`, and `Diff` contracts follow the spec. Pure diff/render functions; inject fetch, clock, and output streams at the CLI boundary. Importing a module must not run the CLI.
+- **Data and output:** Fetch only the first default latest page per forum. Baseline-only first run. One URL-keyed JSON snapshot per forum, replaced through a temporary sibling and rename. Preserve state on failures; continue other forums and exit nonzero. Markdown goes to stdout, diagnostics to stderr. Include the latest-page coverage limit. Ignore local snapshots, generated output, and dependencies in git.
+- **Delivery boundary:** v0 runs manually and locally with no secrets, database, LLM, Telegram, scheduling, or agent delivery. Those require later scoped work; do not add extension infrastructure for them now.
