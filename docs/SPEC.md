@@ -51,13 +51,13 @@ Use small functions and Node built-ins, with no runtime dependencies or framewor
 | --- | --- | --- |
 | `types` | Describe normalized data shared between units. | Types below; no I/O. |
 | `config` | Read and validate the forum list. | `loadConfig(path): Promise<string[]>`, returning normalized URLs in config order. |
-| `discourse` | Fetch and normalize one latest page. | `parseLatest(body: unknown): Topic[]`; `fetchSnapshot(forumUrl, { fetchImpl, now }): Promise<Snapshot>`. |
+| `discourse` | Fetch and normalize one latest page. | `parseLatest(body: unknown): Topic[]`; `fetchSnapshot(forumUrl, { fetchImpl, now, timeoutMs = 15_000 }): Promise<Snapshot>`. |
 | `diff` | Compare two normalized snapshots. | `diffSnapshots(previous: Snapshot \| null, current: Snapshot): Diff`, pure and without mutation. |
 | `snapshots` | Load and replace local JSON state. | `loadSnapshot(stateDir, forumUrl): Promise<Snapshot \| null>`; `saveSnapshot(stateDir, snapshot): Promise<void>`. |
 | `digest` | Render ordered forum results as Markdown. | `renderDigest(results: ForumResult[]): string`, pure. |
-| `cli` | Parse arguments and coordinate one run. | `runCli(argv, { fetchImpl, now, stdout, stderr }): Promise<0 \| 1>`. The executable passes real dependencies and sets the process exit code. |
+| `cli` | Parse arguments and coordinate one run. | `runCli(argv, { fetchImpl, now, cwd, stdout, stderr }): Promise<0 \| 1>`. The executable passes real dependencies, including `process.cwd()`, and sets the process exit code. |
 
-The injected values are plain function arguments, not a dependency-injection framework. Tests call the CLI runner with a fake fetch, fixed clock, captured streams, and real temporary files. Importing modules must not start a run.
+The injected values are plain function arguments, not a dependency-injection framework. `now` has type `() => Date`; `cwd` is an absolute directory path of type `string`. Tests call the CLI runner with a fake fetch, fixed clock, explicit temporary cwd, captured streams, and real temporary files. Resolve default and relative paths against the injected cwd without calling `process.chdir()`. Importing modules must not start a run.
 
 ### Shared contracts
 
@@ -107,7 +107,7 @@ type ForumResult =
 
 1. Parse arguments and validate the entire config before making forum requests or changing state. `--help` short-circuits all config and state access. Unknown options, positionals, or missing flag values fail with code `1`.
 2. Process forums sequentially in config order. Load and validate the previous snapshot; fetch and validate the current page; compute the diff; save the current snapshot. Only then record a successful forum result.
-3. Fetch through native `fetch`, request JSON, apply a fixed 15-second timeout to the operation including body consumption, and make no retries or pagination requests. Non-2xx responses, timeouts, transport failures, invalid JSON, and invalid required fields fail that forum. An empty topics array is a valid page.
+3. Fetch through native `fetch`, request JSON, apply a 15-second timeout to the operation including body consumption, and make no retries or pagination requests. `fetchSnapshot` accepts an optional numeric `timeoutMs` for tests, defaulting to `15_000`; the CLI uses the default and exposes no timeout flag. Non-2xx responses, timeouts, transport failures, invalid JSON, and invalid required fields fail that forum. An empty topics array is a valid page.
 4. Missing snapshot files mean first run. Corrupt JSON, unsupported schema versions, URL mismatches, or other read errors are failures, not permission to reset the baseline. Include forum context and the relevant file or HTTP status in errors without dumping response bodies.
 5. On any forum failure, report it on stderr, keep its previous committed snapshot, record a failed result, and continue. A failed initial run leaves no baseline. A later successful run still establishes one.
 6. Render one final digest including successful and failed forum sections. Exit `0` only if all configured forums succeeded; otherwise `1`. Global config/argument errors produce no digest and no writes. Unexpected runner failures also exit `1`.
@@ -173,7 +173,7 @@ The committed starter `forums.json`, added during CLI implementation, is a nonem
 
 Require absolute HTTP(S) base URLs without credentials, query strings, or fragments. Normalize using Node's URL handling and remove trailing slashes; preserve installation subpaths. Reject duplicate normalized URLs and non-string entries. No display-name, category, secret, or environment-variable configuration is needed.
 
-Default paths are `./forums.json` and `./.gov-diff/`, relative to the invocation directory. `--config <path>` and `--state-dir <path>` override them; relative overrides also resolve from the invocation directory. Changing cwd or state directory selects a different baseline.
+Default paths are `./forums.json` and `./.gov-diff/`, relative to the invocation directory supplied as `runCli`'s `cwd`. `--config <path>` and `--state-dir <path>` override them; relative overrides resolve against that same injected cwd, and absolute overrides remain absolute. Changing cwd or state directory selects a different baseline. Path tests supply distinct temporary cwd values rather than changing the test process's working directory, which is unavailable in Node worker threads. [Node worker restrictions](https://nodejs.org/api/worker_threads.html#class-worker).
 
 Save UTF-8 JSON at `<state-dir>/<sha256-of-normalized-forum-url>.json`. The full URL hash separates forums, including installations on different subpaths. Snapshots contain the shared contract, not raw API responses or post bodies. Runtime-validate snapshots with the same topic invariants, unique IDs, a valid UTC timestamp, schema version `1`, and the expected normalized URL. Removing a forum from config does not delete its state.
 
@@ -187,13 +187,15 @@ Commit a saved public Discourse JSON fixture during fetch implementation with it
 
 Use an injected fake fetch returning fixture responses and a fixed clock. Tests must make no network calls, including localhost: make unmocked fetch fail immediately, and prohibit real HTTP transport in the harness. Exercise the same production fetch adapter through that fake, not a separate test parser. Use real temporary files for state integration and clean them up. The offline npx subprocess smoke uses a temporary npm cache with npm update notices disabled. For hard-to-trigger filesystem failures, inject or mock only the failing filesystem operation; assert the old file remains byte-for-byte intact.
 
+Timeout tests use real timers with a small injected `timeoutMs`, such as 10 ms, and a fake fetch that rejects only when its supplied signal aborts. Cover both a hung request and a response whose body read hangs until the same signal aborts. Assert rejection rather than a precise wall-clock duration, and separately assert that omitting the override uses `15_000`. Do not advance Vitest fake timers to drive `AbortSignal.timeout`: Node captures its own timer function internally. [Node 24 abort implementation](https://github.com/nodejs/node/blob/v24.x/lib/internal/abort_controller.js), [Vitest fake timers](https://vitest.dev/guide/mocking/timers).
+
 | Criterion | Automated proof and required failure/negative cases |
 | --- | --- |
 | S1 | Clean install, strict build, and nonempty offline test suite run in `ci`; harness fails on an unexpected network attempt. Typecheck representative shared contracts so their consumers stay aligned. |
-| S2 | Exact fixture mapping; unknown fields and an empty array accepted; missing envelope, wrong field types, duplicate IDs, invalid counts, HTML/invalid JSON, HTTP 403/429/500, rejection, and timeout fail. Assert the requested URL, JSON header, timeout signal, and absence of retries/pagination; prove timeout behavior with fake time. |
+| S2 | Exact fixture mapping; unknown fields and an empty array accepted; missing envelope, wrong field types, duplicate IDs, invalid counts, HTML/invalid JSON, HTTP 403/429/500, rejection, and timeout fail. Assert the requested URL, JSON header, an abort signal passed to fetch, and absence of retries/pagination. Prove timeout rejection with a small injected `timeoutMs` and abort-aware fake fetch/body, covering both a hung request and hung body read; assert the default is 15 seconds. |
 | S3 | New ID with one and multiple posts, updated ID with exact positive delta, identical snapshots, lower counts, title/slug-only changes, missing IDs, forum mismatch, deterministic ordering, and no input mutation. Include a topic leaving and reentering the saved page to pin the documented `new` semantics. |
 | S4 | First run saves a baseline without topic bullets; identical second run says no changes; failed first fetch creates no file. Distinguish missing state from corrupt JSON, wrong schema/URL, and unreadable state. |
-| S5 | Three-forum fixture run, followed by a second invocation with one new and one updated topic. Assert Markdown links/counts/labels, persisted snapshots, state isolation, config ordering, escaping of Markdown/HTML/line breaks, no-change and baseline sections, path overrides, and trailing-slash normalization. Invalid/empty/duplicate config fails before fetch or writes. |
+| S5 | Three-forum fixture run, followed by a second invocation with one new and one updated topic. Assert Markdown links/counts/labels, persisted snapshots, state isolation, config ordering, escaping of Markdown/HTML/line breaks, no-change and baseline sections, and trailing-slash normalization. Test default paths, relative overrides, and absolute overrides with explicit temporary `cwd` values and no `process.chdir()`. Invalid/empty/duplicate config fails before fetch or writes. |
 | S6 | One forum fails while others advance; failed state stays byte-identical and its next success compares against that old snapshot. Cover fetch, parse, load, and write/rename failures; stderr context; exit code `1`; failed-section rendering. All-forum failure also exits `1`. |
 | S7 | Built Node and offline local npx commands run `--help` without config or state. Invalid options fail. CLI runner tests prove the full data path with fake fetch and actual disk state; subprocess tests verify executable wiring without requiring a live forum. |
 
