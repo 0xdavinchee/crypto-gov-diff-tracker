@@ -39,13 +39,12 @@ Move labels as you go: `gh issue edit <n> --add-label in-progress --remove-label
 
 ## Review rubric (in priority order)
 
+**The bar for any comment or suggestion, in code and spec reviews alike: the problem must be reproducible in a test.** State that test (given / when / then, or the test code) and what it would show. If you cannot write it, leave the comment out. Style, naming, preference and "consider ..." remarks are not findings.
+
 1. Correctness: does it do what the issue says, including edge cases?
 2. Matches the spec and the issue's acceptance tests.
-3. Tests: do they test behavior, and would they fail if the code were wrong?
-4. Security: input handling, secrets, auth, key material.
-5. Simplicity: unnecessary abstraction or dependencies.
-
-Style nits that a linter could catch are not review findings.
+3. Tests: would a missing or weak test let a wrong implementation pass? Show the wrong implementation and the test that should catch it.
+4. Security: input handling, secrets, auth, key material, each shown by a test that exposes it.
 
 ## Knowledge vault
 
