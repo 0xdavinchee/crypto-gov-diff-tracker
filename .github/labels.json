@@ -1,0 +1,8 @@
+[
+  {"name": "spec", "color": "5319e7", "description": "Spec PR open for comment; merge = approval"},
+  {"name": "ready", "color": "0e8a16", "description": "Has acceptance tests, no unmet deps; safe to pick up"},
+  {"name": "in-progress", "color": "fbca04", "description": "An agent is implementing this"},
+  {"name": "in-review", "color": "1d76db", "description": "PR open, waiting for review"},
+  {"name": "needs-human", "color": "d93f0b", "description": "Blocked on a human decision or hit the review cap"},
+  {"name": "blocked", "color": "b60205", "description": "Depends on another open issue"}
+]

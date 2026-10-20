@@ -1,0 +1,31 @@
+name: Task
+description: One implementable unit of the spec. Created by the breakdown stage.
+labels: [ready]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What this issue delivers, in one or two sentences. Link the SPEC.md section.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance tests
+      description: Each line becomes a real test. Cover the happy path and at least one edge or failure case.
+      placeholder: |
+        - [ ] given ..., when ..., then ...
+        - [ ] given invalid ..., when ..., then it fails with ...
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Out of scope
+      description: What this issue must not touch.
+  - type: input
+    id: depends
+    attributes:
+      label: Depends on
+      placeholder: "#12, #13 (or none)"
