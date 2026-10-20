@@ -19,9 +19,9 @@ Technical criteria are automated acceptance requirements. The one-week product e
 | S1 | A fresh checkout on Node.js 24 can install from the lockfile, build TypeScript, and run all tests in a GitHub Actions check named `ci`. | Build and offline test harness in CI. |
 | S2 | One saved Discourse response becomes the exact expected normalized topics; invalid required data fails the forum instead of silently dropping topics. | Fixture parser and fetch adapter tests, including malformed and HTTP failure cases. |
 | S3 | Comparisons identify IDs absent from the previous snapshot and positive post-count increases exactly; unchanged, decreased, and missing topics produce no changes. | Table-driven diff tests with exact IDs, kinds, and counts. |
-| S4 | A forum with no previous snapshot gets a saved baseline and no topic-change entries. The same response on the next run produces no changes. | Two invocations of the CLI runner against a temporary state directory. |
-| S5 | A config containing three forums produces one ordered Markdown digest with forum headings, changed topic titles, post counts, and original-topic links. Snapshots persist independently across invocations. | CLI integration harness with two response sets, exact output assertions, and JSON reads from disk. |
-| S6 | A failed forum leaves its previous snapshot untouched; other forums still save and render successfully. Any forum failure produces stderr diagnostics and exit code `1`. | Partial-failure integration tests, including network, corrupt state, and save failures. |
+| S4 | A forum with no previous snapshot reports a baseline without topic-change entries and saves it only after the digest write succeeds. After a successful save, the same response on the next run produces no changes. Failed output or an initial save failure leaves no baseline file. | Repeated CLI-runner invocations against temporary state, including failed first output and save cases. |
+| S5 | A config containing three forums produces one ordered Markdown digest with forum headings, changed topic titles, post counts, and original-topic links. The complete stdout write succeeds before any snapshot save starts; snapshots then persist independently across invocations. | CLI integration harness with exact output assertions, a controlled pending stdout write, save-order assertions, and JSON reads from disk. |
+| S6 | A load/fetch/parse failure appears as a failed forum section and preserves its state. Output failure preserves all snapshots and starts no saves. After successful output, a save failure preserves that forum's prior state and reports only on stderr; other prepared forums still save. Any failure produces exit code `1`. | Partial-failure and output-order integration cases below, including repeated changes after a failed save. |
 | S7 | The built package starts through both `node dist/cli.js` and `npx --offline --package . crypto-gov-diff-tracker`; `--help` exits `0` without config, network, or snapshot writes. | Subprocess smoke tests of both entry paths plus runner tests of argument handling. |
 | V1 | During seven consecutive days following three forums, the owner voluntarily uses the digest on at least four distinct days and opens at least one useful topic link from it. | Manual dated tally of use days and useful links, kept privately; no app telemetry. |
 
@@ -34,7 +34,7 @@ After that week, reassess rather than add features if the owner still manually c
 1. TypeScript scaffold, Vitest, npm lockfile, GitHub Actions, and shared `Topic`, `Snapshot`, and `Diff` types.
 2. One anonymous `GET` of each configured forum's `latest.json`, using the forum's default first page. No pagination, per-topic requests, or category filtering. Include every topic returned to an anonymous reader.
 3. Compare the fetched page with that forum's previous saved page. First successful run establishes a baseline. Subsequent runs report new observed IDs and increases in `posts_count`.
-4. Read a JSON list of forum base URLs, save one replacement JSON snapshot per successful forum, and write a Markdown digest to stdout. Provide `--config`, `--state-dir`, and `--help`.
+4. Read a JSON list of forum base URLs, render and write the Markdown digest to stdout, and save replacement snapshots only after that write succeeds. Provide `--config`, `--state-dir`, and `--help`.
 5. Continue across forum failures, report useful diagnostics, and preserve failed forums' state.
 
 ### Excluded
@@ -42,6 +42,14 @@ After that week, reassess rather than add features if the owner still manually c
 Telegram, scheduling or cron, LLM summaries, importance filtering, dashboards, on-chain data, participant weighting, authentication or secrets, databases, post bodies, per-reply links, edits and reaction tracking, full history, automatic retries, parallel runs, and npm registry publishing.
 
 One-page coverage is intentional. Recent discussion is the owner's initial proxy for signal, not a completeness or importance guarantee. The digest must say it covers the latest page only.
+
+## Decisions
+
+### Print first, then save (owner decision, 2026-10-21)
+
+Prepare each forum's diff, render the digest, and finish writing it to stdout before saving any snapshots. The owner selected this order in response to the [delivery-order review on PR #1](https://github.com/0xdavinchee/crypto-gov-diff-tracker/pull/1#discussion_r4330857531). A failed output write must not advance a baseline and hide changes from the next comparison.
+
+The accepted trade-off is repetition: after successful output, a failed save or interruption before saving can repeat changes next run. Save failures leave that forum's previous snapshot intact, report on stderr, and make the process exit `1`; they cannot change a digest already printed. Continue saving other prepared forums independently. There is no transaction across forums, delivery acknowledgment from the reader, replay log, or exactly-once guarantee. Successful stdout completion means the write succeeded, not that a person or downstream process consumed the digest.
 
 ## Architecture (units, each with one job and its interface)
 
@@ -58,6 +66,8 @@ Use small functions and Node built-ins, with no runtime dependencies or framewor
 | `cli` | Parse arguments and coordinate one run. | `runCli(argv, { fetchImpl, now, cwd, stdout, stderr }): Promise<0 \| 1>`. The executable passes real dependencies, including `process.cwd()`, and sets the process exit code. |
 
 The injected values are plain function arguments, not a dependency-injection framework. `now` has type `() => Date`; `cwd` is an absolute directory path of type `string`. Tests call the CLI runner with a fake fetch, fixed clock, explicit temporary cwd, captured streams, and real temporary files. Resolve default and relative paths against the injected cwd without calling `process.chdir()`. Importing modules must not start a run.
+
+The injected `stdout` is an awaitable writer with type `(text: string) => Promise<void>`. Its promise resolves only after the whole digest write completes successfully and rejects on write errors, including `EPIPE`; the runner also catches a writer that throws synchronously. The executable's adapter waits for the Node write callback and handles stream errors. Calling `write()` or inspecting its boolean return is not completion: that boolean reports backpressure. Set the exit code after the awaited run rather than forcing exit while output is pending. [Node writable completion](https://nodejs.org/api/stream.html#writablewritechunk-encoding-callback), [process output and exit](https://nodejs.org/api/process.html#a-note-on-process-io).
 
 ### Shared contracts
 
@@ -106,11 +116,13 @@ type ForumResult =
 ### Run and failure rules
 
 1. Parse arguments and validate the entire config before making forum requests or changing state. `--help` short-circuits all config and state access. Unknown options, positionals, or missing flag values fail with code `1`.
-2. Process forums sequentially in config order. Load and validate the previous snapshot; fetch and validate the current page; compute the diff; save the current snapshot. Only then record a successful forum result.
+2. Prepare forums sequentially in config order. Load and validate the previous snapshot; fetch and validate the current page; compute the diff. Record an `ok` result and retain its current snapshot in memory for later saving. `ForumResult.status` describes preparation, not persistence. Do not create the state directory, write temporary snapshot files, or replace snapshots during preparation.
 3. Fetch through native `fetch`, request JSON, apply a 15-second timeout to the operation including body consumption, and make no retries or pagination requests. `fetchSnapshot` accepts an optional numeric `timeoutMs` for tests, defaulting to `15_000`; the CLI uses the default and exposes no timeout flag. Non-2xx responses, timeouts, transport failures, invalid JSON, and invalid required fields fail that forum. An empty topics array is a valid page.
 4. Missing snapshot files mean first run. Corrupt JSON, unsupported schema versions, URL mismatches, or other read errors are failures, not permission to reset the baseline. Include forum context and the relevant file or HTTP status in errors without dumping response bodies.
-5. On any forum failure, report it on stderr, keep its previous committed snapshot, record a failed result, and continue. A failed initial run leaves no baseline. A later successful run still establishes one.
-6. Render one final digest including successful and failed forum sections. Exit `0` only if all configured forums succeeded; otherwise `1`. Global config/argument errors produce no digest and no writes. Unexpected runner failures also exit `1`.
+5. On a preparation failure, report it on stderr, keep its previous committed snapshot, record a failed result, and continue preparing other forums. Do not queue a snapshot for the failed forum. A failed initial preparation leaves no baseline.
+6. After preparing all forums, render one digest containing both prepared and failed sections and await the complete stdout write. A rendering or output failure, including an asynchronous write rejection or `EPIPE`, reports on stderr and exits `1` without attempting any snapshot saves. Existing snapshot files stay byte-for-byte intact and missing baselines remain missing, even if part of the digest reached stdout before the error.
+7. Only after the stdout writer resolves successfully, save the prepared snapshots sequentially in config order. On a save failure, preserve that forum's prior snapshot or absence of one, report the forum and file context on stderr, and continue saving other prepared forums. Do not rewrite or append to the printed digest to show a save failure; that forum's changes or baseline section can repeat next run.
+8. Exit `0` only if every forum prepared successfully, the digest write succeeded, and every prepared snapshot saved successfully; otherwise exit `1`. Even if all forums fail preparation, write the failed-section digest and exit `1` without saves. Global config/argument errors produce no digest and no writes. Unexpected runner failures also exit `1`.
 
 ### Digest contract
 
@@ -135,7 +147,7 @@ No changes.
 Failed; see stderr.
 ```
 
-A first successful run uses `Baseline created.` instead of topic bullets or `No changes.`. Escape Markdown in forum labels and titles, neutralize raw HTML, and collapse embedded title line breaks so external titles cannot create extra digest structure. Build topic URLs from the normalized forum base, encoded slug, and ID. Keep diagnostics out of stdout. Exact whitespace beyond valid, deterministic Markdown is the builder's choice; test the chosen output.
+A prepared forum with no prior snapshot uses `Baseline captured.` instead of topic bullets or `No changes.`. This describes the fetched baseline in memory, not a completed save. `Failed; see stderr.` describes preparation failures only; a later save failure appears only on stderr and in the exit code. Escape Markdown in forum labels and titles, neutralize raw HTML, and collapse embedded title line breaks so external titles cannot create extra digest structure. Build topic URLs from the normalized forum base, encoded slug, and ID. Keep diagnostics out of stdout. Exact whitespace beyond valid, deterministic Markdown is the builder's choice; test the chosen output.
 
 ## Data and external dependencies (verified 2026-10-21)
 
@@ -177,7 +189,7 @@ Default paths are `./forums.json` and `./.gov-diff/`, relative to the invocation
 
 Save UTF-8 JSON at `<state-dir>/<sha256-of-normalized-forum-url>.json`. The full URL hash separates forums, including installations on different subpaths. Snapshots contain the shared contract, not raw API responses or post bodies. Runtime-validate snapshots with the same topic invariants, unique IDs, a valid UTC timestamp, schema version `1`, and the expected normalized URL. Removing a forum from config does not delete its state.
 
-Create the state directory when needed. Write a complete JSON file to a unique temporary sibling, then rename it over the destination; do not truncate the previous snapshot in place. A write/rename failure must retain the previous destination and fail that forum. Clean up temporary files on handled failures when possible. This protects replacement on a local filesystem; power-loss durability and multi-process coordination are out of scope. Ignore `.gov-diff/`, `dist/`, test artifacts, and `node_modules/` in git.
+Create the state directory when needed during saving, only after the digest write succeeds. Write a complete JSON file to a unique temporary sibling, then rename it over the destination; do not truncate the previous snapshot in place. A write/rename failure must retain the previous destination and fail that forum's save, reported on stderr without changing the already printed digest. Clean up temporary files on handled failures when possible. This protects replacement on a local filesystem; power-loss durability and multi-process coordination are out of scope. Ignore `.gov-diff/`, `dist/`, test artifacts, and `node_modules/` in git.
 
 ## Testing strategy
 
@@ -194,10 +206,22 @@ Timeout tests use real timers with a small injected `timeoutMs`, such as 10 ms, 
 | S1 | Clean install, strict build, and nonempty offline test suite run in `ci`; harness fails on an unexpected network attempt. Typecheck representative shared contracts so their consumers stay aligned. |
 | S2 | Exact fixture mapping; unknown fields and an empty array accepted; missing envelope, wrong field types, duplicate IDs, invalid counts, HTML/invalid JSON, HTTP 403/429/500, rejection, and timeout fail. Assert the requested URL, JSON header, an abort signal passed to fetch, and absence of retries/pagination. Prove timeout rejection with a small injected `timeoutMs` and abort-aware fake fetch/body, covering both a hung request and hung body read; assert the default is 15 seconds. |
 | S3 | New ID with one and multiple posts, updated ID with exact positive delta, identical snapshots, lower counts, title/slug-only changes, missing IDs, forum mismatch, deterministic ordering, and no input mutation. Include a topic leaving and reentering the saved page to pin the documented `new` semantics. |
-| S4 | First run saves a baseline without topic bullets; identical second run says no changes; failed first fetch creates no file. Distinguish missing state from corrupt JSON, wrong schema/URL, and unreadable state. |
-| S5 | Three-forum fixture run, followed by a second invocation with one new and one updated topic. Assert Markdown links/counts/labels, persisted snapshots, state isolation, config ordering, escaping of Markdown/HTML/line breaks, no-change and baseline sections, and trailing-slash normalization. Test default paths, relative overrides, and absolute overrides with explicit temporary `cwd` values and no `process.chdir()`. Invalid/empty/duplicate config fails before fetch or writes. |
-| S6 | One forum fails while others advance; failed state stays byte-identical and its next success compares against that old snapshot. Cover fetch, parse, load, and write/rename failures; stderr context; exit code `1`; failed-section rendering. All-forum failure also exits `1`. |
+| S4 | First run prints `Baseline captured.` without topic bullets, then saves; identical second run says no changes. Failed first fetch, output, or save creates no baseline file; after failed output/save, a successful retry still reports a baseline. Distinguish missing state from corrupt JSON, wrong schema/URL, and unreadable state. |
+| S5 | Three-forum fixture run, followed by a second invocation with one new and one updated topic. Assert Markdown links/counts/labels, persisted snapshots, state isolation, config ordering, escaping of Markdown/HTML/line breaks, no-change and baseline sections, and trailing-slash normalization. Hold the stdout promise pending and assert no saves or state-directory creation; resolve it and assert the complete write precedes every save. Test default paths, relative overrides, and absolute overrides with explicit temporary `cwd` values and no `process.chdir()`. Invalid/empty/duplicate config fails before fetch or writes. |
+| S6 | Cover the output and snapshot ordering cases below through the public CLI runner. Load/fetch/parse failures render failed sections; save failures occur after output and affect stderr/exit status only. Assert byte-identical failed state, continued saves for other prepared forums, replay after save failure, no saves on output failure, and exit code `1`. All-forum preparation failure also writes its failure digest and exits `1` without saves. |
 | S7 | Built Node and offline local npx commands run `--help` without config or state. Invalid options fail. CLI runner tests prove the full data path with fake fetch and actual disk state; subprocess tests verify executable wiring without requiring a live forum. |
+
+### Output and snapshot ordering cases (S4-S6)
+
+Use fixture-backed fetches and real temporary snapshot files. A controllable stdout promise supplies deterministic pending, success, and error outcomes without piping to a live process or making network calls. Observe snapshot-save calls so a save attempted and rolled back would still fail the ordering test. For the executable's stdout adapter, use a local fake writable whose completion callback and error are controlled by the test; prove its promise waits for completion and rejects an asynchronous write error rather than relying solely on the runner's fake writer.
+
+| Given / when | Required result |
+| --- | --- |
+| Multiple forums prepare successfully; the stdout promise remains pending, then resolves. | Before resolution, no save is attempted, old files are unchanged, and missing state directories remain absent. After resolution, each prepared snapshot saves in config order; the run exits `0`. |
+| A writer throws synchronously, or rejects asynchronously after capturing part of the digest, including an `EPIPE` error. | No snapshot save is attempted for any forum; existing files remain byte-identical and new files/directories are absent. Stderr identifies the output failure and the run exits `1`. With the same fixture on a successful retry, previously unsaved changes are still reported. |
+| The digest write succeeds; saving forum A fails while forum B can save. | The digest contains A's prepared changes and is written exactly once, with no replacement failed section or appended save diagnostic. Stderr names A and the failed file, A's prior snapshot remains byte-identical, B advances, and the run exits `1`. On the same fixture next run, A's changes repeat while B reports no changes. |
+| Forum A fails during load, fetch, or parse; forum B prepares successfully. | The digest includes A's failed section and B's prepared result. After successful output, save only B, preserve A, report A on stderr, and exit `1`. |
+| A first-run forum has no snapshot; its output fails or its post-output save fails. | No baseline file is created. A later successful retry still prints `Baseline captured.` without topic-change bullets, then saves the baseline. |
 
 V1 is a manual product test; no automated test can prove voluntary use or usefulness. The CLI milestone requires a dated manual check of live forum access and topic links outside CI, recorded in implementation PR validation.
 
@@ -229,7 +253,7 @@ The local package path and offline flag avoid depending on a published package o
 1. **Scaffold:** Node 24/npm, strict TypeScript, Vitest offline harness, shared contracts, build/test commands, and the `ci` workflow. Deliver a repository that installs, builds, and tests, with no runtime dependencies. Proves S1; no fake product functionality.
 2. **Fetch and parse:** Saved fixture, validation, and public latest-page fetch adapter, with negative cases and a bounded timeout. Deliver a callable module returning normalized snapshots. Proves S2 without live network tests.
 3. **Diff and snapshot storage:** Pure comparison, first-run semantics, validated local JSON loading, and safe replacement. Deliver callable units with temporary-file integration tests, including preservation on failure. Proves S3 and the state behavior needed by S4/S6. Depends on scaffold; can use synthetic normalized snapshots without depending on the fetch milestone.
-4. **CLI and digest:** Starter config, flags, executable mapping, Markdown output, forum isolation, error handling, and full offline integration tests. Deliver the locally runnable product through both entry paths; perform a dated manual forum smoke and start the one-week experiment. Proves S4-S7 and enables V1. Depends on fetch and diff/storage.
+4. **CLI and digest:** Starter config, flags, executable mapping, Markdown output completed before snapshot saves, forum isolation, error handling, and full offline integration tests of output/save ordering and retries after failures. Deliver the locally runnable product through both entry paths; perform a dated manual forum smoke and start the one-week experiment. Proves S4-S7 and enables V1. Depends on fetch and diff/storage.
 
 These describe shipping boundaries, not implementation issues. Issue creation is the separately requested breakdown stage. Each implementation PR must pass `ci`; only the human merges.
 
@@ -248,7 +272,6 @@ These describe shipping boundaries, not implementation issues. Issue creation is
 
 - Replacing page-sized snapshots keeps v0 small but forgets topics that leave the page. A resurfacing old topic can be labeled new and its whole count shown. Preventing that needs retained history or more fetching and is a deliberate cut.
 - Public APIs and fields can change; blocked, rate-limited, or malformed responses fail visibly and retain state. Authentication, anti-bot bypasses, retries, and provider-specific adapters are cut. Recheck dependency compatibility when scaffolding if versions have moved; do not silently migrate majors.
-- Storage is per successful run, not per acknowledged delivery. State is saved before the digest is written; interruption or stdout failure can leave advanced snapshots without a visible digest. There is no delivery acknowledgment, replay log, or exactly-once guarantee. A broken output stream exits nonzero but does not roll back committed state.
 - Only one process may use a state directory at a time. Locking, backups, schema migration, crash recovery beyond replacement safety, and automated cleanup of abandoned temporary files are cut. Unsupported stored schemas fail with instructions to move aside or deliberately remove the snapshot for a fresh baseline.
 - The fixed 15-second timeout, sequential processing, strict validation, URL-hashed filenames, deterministic ID ordering, and no runtime dependencies are spec-author choices within the accepted defaults. Private helper names, exact whitespace, and TypeScript config file organization are left to the builder.
 - Do not turn future delivery into a plugin system, queue, generic event bus, or agent SDK in v0. The existing separation of fetching, comparison, and rendering is enough for a later change.
